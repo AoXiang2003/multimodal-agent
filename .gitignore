@@ -1,0 +1,29 @@
+# Python 虚拟环境
+jarvis_env/
+venv/
+env/
+*.pyc
+__pycache__/
+
+# 模型权重文件（体积大）
+models/*.bin
+models/*.safetensors
+models/*.pt
+models/*.pth
+*.ckpt
+*.h5
+
+# 输出目录（生成的文件）
+jarvis_agent/output/
+logs/
+tmp/
+cache/
+
+# 其他大型二进制
+*.dll
+*.so
+*.dylib
+*.exe
+*.lib
+jarvis_agent/config.yaml
+.claude/
