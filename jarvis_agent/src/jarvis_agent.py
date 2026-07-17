@@ -660,14 +660,14 @@ class JarvisAgent:
         reasons = []
         if face_valid < 0.5:
             reasons.append('Face unreliable')
-        if voice_unclear > 0.5:
+        if voice_unclear >= 0.5:
             reasons.append('Voice unclear')
         reason_str = ' + '.join(reasons) if reasons else None
 
         if jsd <= 0.35:
             return ('moderate', reason_str)
         else:
-            if face_valid >= 0.5 and voice_unclear <= 0.5:
+            if face_valid >= 0.5 and voice_unclear < 0.5:
                 return ('candidate', None)
             else:
                 return ('high_unreliable', reason_str)
@@ -784,8 +784,18 @@ class JarvisAgent:
                 mid = max(mid, eps)
                 jsd += 0.5 * p * np.log(p / mid) + 0.5 * q * np.log(q / mid)
 
-            # ---- 提取 Top-2 标签（用于显示） ----
-            sorted_v = sorted(vp.items(), key=lambda x: x[1], reverse=True)
+            # ---- 提取 Top-2 标签（9类→8类映射，与 _format_utterance_with_top2 一致） ----
+            v_mapped = {}
+            v_unclear = 0.0
+            for label, prob in vp.items():
+                mapped_label = VOICE_TO_FACE.get(label)
+                if mapped_label:
+                    v_mapped[mapped_label] = v_mapped.get(mapped_label, 0) + prob
+                else:
+                    v_unclear += prob
+            if v_unclear > 0:
+                v_mapped['unclear'] = v_unclear
+            sorted_v = sorted(v_mapped.items(), key=lambda x: x[1], reverse=True)
             top_v1, top_v2 = sorted_v[0], (sorted_v[1] if len(sorted_v) > 1 else sorted_v[0])
             voice_top2_str = f"{top_v1[0]}({top_v1[1]:.2f})/{top_v2[0]}({top_v2[1]:.2f})"
 
@@ -853,12 +863,27 @@ class JarvisAgent:
     def _format_utterance_with_top2(self, text: str, voice_probs: dict, face_probs: list) -> str:
         """
         将一句话格式化为带 Top‑2 概率的标注。
-        voice_probs: 9类概率字典（或空字典）
-        face_probs: 7类概率列表（或全零列表）
+        voice_probs: 9类概率字典 → 自动映射到8类（7情绪 + unclear）
+        face_probs: 7类概率列表
         """
-        # ---- 语音 Top‑2 ----
+        VOICE_9TO8 = {
+            'frustrated': 'angry', 'neutral': 'neutral', 'angry': 'angry',
+            'sad': 'sad', 'excited': 'surprised', 'happy': 'happy',
+            'disgust': 'disgust', 'fear': 'fear',
+        }
+        # ---- 语音 Top‑2 (9类→8类：7情绪映射合并 + unclear保留) ----
         if voice_probs:
-            sorted_v = sorted(voice_probs.items(), key=lambda x: x[1], reverse=True)
+            mapped = {}
+            unclear_prob = 0.0
+            for label, prob in voice_probs.items():
+                mapped_label = VOICE_9TO8.get(label)
+                if mapped_label:
+                    mapped[mapped_label] = mapped.get(mapped_label, 0) + prob
+                else:
+                    unclear_prob += prob
+            if unclear_prob > 0:
+                mapped['unclear'] = unclear_prob
+            sorted_v = sorted(mapped.items(), key=lambda x: x[1], reverse=True)
             top1_v, top2_v = sorted_v[0], (sorted_v[1] if len(sorted_v) > 1 else sorted_v[0])
             voice_str = f"{top1_v[0]}({top1_v[1]:.2f})/{top2_v[0]}({top2_v[1]:.2f})"
         else:
@@ -948,27 +973,22 @@ class JarvisAgent:
         )
 
 
-    def _build_conflict_attribution_section(self, observation: MultimodalObservation) -> str:
-        """Build the CONFLICT ATTRIBUTION section with four tiers + FULL-SCAN.
+    def _build_conflict_attribution_section(self, observation: MultimodalObservation, total_utterances: int = 0) -> str:
+        """Build the CONFLICT ATTRIBUTION section with three tiers + window stats.
 
         Output layers:
           High Conflict       — JSD > 0.35 + both modalities reliable  → 5-type LLM attribution
           High Conflict/Noisy — JSD > 0.35 + one modality noisy        → text vs reliable modality
-          Moderate Conflict   — 0.2 < JSD ≤ 0.35                        → noted, no action required
-          Signal Quality Note — JSD ≤ 0.2, modality flagged             → quality warning only
+          Mild Divergence     — 0.2 < JSD ≤ 0.35 + both reliable       → 1-line count
+          Signal Quality Note — modality flagged (any JSD range)         → quality warning
           Unusable            — both modalities unreliable               → skipped
-        Plus a mandatory FULL-SCAN CHECK on every utterance.
+        Plus window utterance count for zero-drop guarantee.
         """
-        import re
-
-        def _extract_unclear(voice_top2_str):
-            match = re.search(r'unclear\(([\d.]+)\)', voice_top2_str)
-            return float(match.group(1)) if match else 0.0
-
         candidates = []   # (speaker, text, v_t2, f_t2, jsd_str)
-        moderates = []    # (speaker, text, v_t2, f_t2, jsd_str, reasons)
         partial = []      # (speaker, text, v_t2, f_t2, jsd_str, reasons, use_instruction)
         skipped = []      # (speaker, text, reasons) — both modalities unreliable
+        low_conflicts = []  # (speaker, text, v_t2, f_t2, reasons) — JSD≤0.2 quality or 0.2-0.35 noise
+        mild_count = 0    # 0.2<JSD≤0.35 + both reliable → counted, not listed
 
         all_conflicts = (
             [("User", c) for c in (observation.top_conflicts_user or [])] +
@@ -977,20 +997,27 @@ class JarvisAgent:
 
         for speaker, conflict in all_conflicts:
             jsd, text, voice_top2, face_top2, face_valid, unclear_prob = conflict
-            voice_unclear = _extract_unclear(voice_top2)
-            result = self._conflict_level(jsd, face_valid, voice_unclear)
+            voice_unclear = unclear_prob
+            result = self._conflict_level(jsd, face_valid, unclear_prob)
             if result is None:
                 continue
             level, reasons = result
             if level == "candidate":
                 candidates.append((speaker, text[:60], voice_top2, face_top2, f"{jsd:.3f}", f"{face_valid:.2f}"))
             elif level == "moderate":
-                moderates.append((speaker, text[:60], voice_top2, face_top2, f"{jsd:.3f}", reasons))
+                # Triage: #5→count, #6-7→Signal Quality, #8→Unusable
+                if face_valid >= 0.5 and voice_unclear < 0.5:
+                    mild_count += 1
+                elif face_valid < 0.5 and voice_unclear >= 0.5:
+                    skipped.append((speaker, text[:60], reasons if reasons else "both unreliable"))
+                else:
+                    low_conflicts.append((speaker, text[:60], voice_top2, face_top2,
+                                         f"JSD={jsd:.3f} + {'Voice unclear' if voice_unclear >= 0.5 else 'Face unreliable'}"))
             elif level == "high_unreliable":
                 # Determine which modality is still usable
                 if face_valid >= 0.5:
                     use = "face+text only (voice noisy, JSD may be noise)"
-                elif voice_unclear <= 0.5:
+                elif voice_unclear < 0.5:
                     use = "voice+text only (face unreliable, JSD may be noise)"
                 else:
                     skipped.append((speaker, text[:60], reasons if reasons else "both unreliable"))
@@ -998,32 +1025,24 @@ class JarvisAgent:
                 partial.append((speaker, text[:60], voice_top2, face_top2, f"{jsd:.3f}", reasons, use))
 
         # ================================================================
-        # Collect JSD≤0.2 entries with unreliable modalities (no conflict, quality note only)
+        # Append JSD≤0.2 entries with unreliable modalities (no conflict, quality note only)
         # ================================================================
-        low_conflicts = []
         for speaker, entries in [("User", observation.low_conflicts_user or []),
                                   ("Partner", observation.low_conflicts_partner or [])]:
             for entry in entries:
                 jsd, text, v_t2, f_t2, fv, up, reasons = entry
-                low_conflicts.append((speaker, text[:60], v_t2, f_t2, reasons))
+                low_conflicts.append((speaker, text[:60], v_t2, f_t2, f"JSD={jsd:.3f} + {reasons}"))
 
         # ================================================================
-        # Build FULL-SCAN section (always present)
+        # Window coverage stats (replaces FULL-SCAN — analysis already done by Python)
         # ================================================================
-        full_scan = [
-            "",
-            "──────────────────────────────────────",
-            "**FULL-SCAN CHECK**: Report EVERY utterance in order. One compact line per utterance:",
-            '  N. [Speaker] "text..." V:top1(.pp) F:top1(.pp) → M:[OK/MISMATCH:why] S:[N/A/NO SHIFT/SHIFT:A→B]',
-            "",
-            "Rules:",
-            "  M (Match): Compare Voice Top1 vs Face Top1 vs text tone. If consistent → OK. If contradictory → MISMATCH:why.",
-            "  S (Shift): Dominant emotion change vs PREVIOUS utterance (any speaker). First utterance → N/A.",
-            "  F=? → note F:N/A.",
-            "",
-            "CRITICAL: List EVERY utterance. No skip. No merge. No exceptions.",
-            "Output as separate section — do not merge with EMOTIONS.",
-        ]
+        window_stats = f"\nWindow: {total_utterances} utterances — all covered in analysis above."
+
+        # ================================================================
+        # Window-level alignment summary (used by both branches)
+        # ================================================================
+        avg_u = getattr(observation, 'jsd_user', 0) or 0
+        avg_p = getattr(observation, 'jsd_partner', 0) or 0
 
         # ================================================================
         # Case: no candidates
@@ -1031,8 +1050,12 @@ class JarvisAgent:
         if not candidates:
             lines = [
                 "**CONFLICT ATTRIBUTION**:",
+                f"Window voice-face alignment: User avg JSD={avg_u:.3f} | Partner avg JSD={avg_p:.3f}",
                 "No High Conflict items in this window (no JSD>0.35 with both modalities reliable).",
             ]
+
+            if mild_count > 0:
+                lines.append(f"Mild divergence: {mild_count} utterance(s) (0.2<JSD≤0.35, both reliable), see window stats above.")
 
             if partial:
                 lines.append("")
@@ -1042,13 +1065,6 @@ class JarvisAgent:
                     lines.append(f'  - [{speaker}{tag}] "{text}..." \u2014 {use}')
                     lines.append(f'    Voice: {v_t2} | Face: {f_t2} | JSD={jsd}')
 
-            if moderates:
-                lines.append("")
-                lines.append("Moderate Conflict (0.2<JSD\u22640.35, no action required):")
-                for speaker, text, v_t2, f_t2, jsd, reasons in moderates:
-                    tag = f" ({reasons})" if reasons else ""
-                    lines.append(f'  - [{speaker}{tag}] "{text}..." \u2014 Voice: {v_t2} | Face: {f_t2}')
-
             if skipped:
                 lines.append("")
                 lines.append("Unusable (both modalities unreliable, no comparison possible):")
@@ -1057,18 +1073,19 @@ class JarvisAgent:
 
             if low_conflicts:
                 lines.append("")
-                lines.append("Signal Quality Note (JSD\u22640.2, no conflict, but modality quality flagged):")
+                lines.append("Signal Quality Note (modality quality flagged, voice-face comparison may be unreliable):")
                 for speaker, text, v_t2, f_t2, reasons in low_conflicts:
                     lines.append(f'  - [{speaker} ({reasons})] "{text}..." \u2014 Voice: {v_t2} | Face: {f_t2}')
 
-            lines.extend(full_scan)
+            lines.append(window_stats)
             return "\n".join(lines)
 
         # ================================================================
-        # Case: candidates exist — High Conflict + Noisy Signal + Moderate + FULL-SCAN
+        # Case: candidates exist — High Conflict + Noisy Signal + FULL-SCAN
         # ================================================================
         lines = [
             "**CONFLICT ATTRIBUTION**:",
+            f"Window voice-face alignment: User avg JSD={avg_u:.3f} | Partner avg JSD={avg_p:.3f}",
             f"The system flagged {len(candidates)} utterance(s) with voice-face mismatch (both modalities reliable).",
             f"You MUST address EXACTLY the {len(candidates)} items listed in High Conflict below — no more, no less. Do NOT reference utterances from Recent History. Address each INDIVIDUALLY with its number. Do NOT summarize or group them. Pick ONE explanation per item.",
             "",
@@ -1094,6 +1111,10 @@ class JarvisAgent:
         lines.append("")
         lines.append('For each [User] item, pick EXACTLY ONE type (1-5). Write the type name explicitly (e.g., "Suppressed emotion → I sense..."). Do NOT use generic descriptions like "shows voice-face conflict." Output in this exact format per item: "N. [TYPE] → "specific response text"" (include the item number, type name, and quoted utterance text).')
 
+        if mild_count > 0:
+            lines.append("")
+            lines.append(f"Mild divergence: {mild_count} utterance(s) (0.2<JSD≤0.35, both reliable), see window stats above.")
+
         if partial:
             lines.append("")
             lines.append("High Conflict \u2014 Noisy Signal (JSD>0.35 but one modality unreliable, use reliable modality only):")
@@ -1101,13 +1122,6 @@ class JarvisAgent:
                 tag = f" ({reasons})" if reasons else ""
                 lines.append(f'  - [{speaker}{tag}] "{text}..." \u2014 {use}')
                 lines.append(f'    Voice: {v_t2} | Face: {f_t2} | JSD={jsd}')
-
-        if moderates:
-            lines.append("")
-            lines.append("Moderate Conflict (0.2<JSD\u22640.35, no action required):")
-            for speaker, text, v_t2, f_t2, jsd, reasons in moderates:
-                tag = f" ({reasons})" if reasons else ""
-                lines.append(f'  - [{speaker}{tag}] "{text}..."')
 
         if skipped:
             lines.append("")
@@ -1117,11 +1131,11 @@ class JarvisAgent:
 
         if low_conflicts:
             lines.append("")
-            lines.append("Signal Quality Note (JSD\u22640.2, no conflict, but modality quality flagged):")
+            lines.append("Signal Quality Note (modality quality flagged, voice-face comparison may be unreliable):")
             for speaker, text, v_t2, f_t2, reasons in low_conflicts:
                 lines.append(f'  - [{speaker} ({reasons})] "{text}..." \u2014 Voice: {v_t2} | Face: {f_t2}')
 
-        lines.extend(full_scan)
+        lines.append(window_stats)
         return "\n".join(lines)
     def _build_analysis_prompt_with_summary(
             self,
@@ -1212,14 +1226,18 @@ class JarvisAgent:
         # ---- 构建 Prompt ----
         window_size = self.utt_per_window
 
-        # Store conflicts to observation BEFORE building attribution section
+        # Store ALL computed fields to observation BEFORE building attribution section
         observation.top_conflicts_user = jsd_user.get('top_conflicts', [])
         observation.top_conflicts_partner = jsd_partner.get('top_conflicts', [])
         observation.low_conflicts_user = jsd_user.get('low_quality', [])
         observation.low_conflicts_partner = jsd_partner.get('low_quality', [])
+        observation.jsd_user = jsd_user.get('avg_jsd', 0.0)
+        observation.jsd_partner = jsd_partner.get('avg_jsd', 0.0)
 
-        # Build dynamic CONFLICT ATTRIBUTION section
-        conflict_attribution_section = self._build_conflict_attribution_section(observation)
+        total_utterances = len(user_texts) + len(partner_texts)
+
+        # Build dynamic CONFLICT ATTRIBUTION section (now sees correct jsd_user/jsd_partner)
+        conflict_attribution_section = self._build_conflict_attribution_section(observation, total_utterances)
 
         prompt = REALTIME_ANALYSIS_PROMPT_WITH_SUMMARY.format(
             window_size=window_size,
@@ -1236,11 +1254,7 @@ class JarvisAgent:
         # 日志：完整冲突摘要
         logger.info(f"=== CONFLICT SUMMARY ===\n{conflict_summary if conflict_summary else '(no conflicts)'}")
 
-        # ===== 将 JSD 和不确定性写入 observation（决策门限用） =====
-        observation.jsd_user = jsd_user.get('avg_jsd', 0.0)
-        observation.jsd_partner = jsd_partner.get('avg_jsd', 0.0)
-
-        # top_conflicts already stored above (before template format)
+        # top_conflicts and jsd already stored above (before template format)
 
         # 计算面部不确定性：从 observation 的 face_valid_ratios 列表取平均有效占比
         user_fvr = getattr(observation, 'user_face_valid_ratios', [])

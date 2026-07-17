@@ -241,14 +241,10 @@ class ContextManager:
             # 优先使用 Top2 格式，回退到纯文本
             user_display = turn.user_speech_top2 or turn.user_speech
             partner_display = turn.partner_speech_top2 or turn.partner_speech
-            # 截取 gate_prefix 的简短标签（去掉具体句子文本）
-            import re
-            short_tag = re.sub(r" (?:in|:) '.+'", "", turn.gate_prefix) if turn.gate_prefix else ""
             lines.append(
                 f"[Turn {i+1}]\n"
                 f"  User: {user_display}\n"
                 f"  Partner: {partner_display}"
-                f"{'  ' + short_tag if short_tag else ''}"
             )
         return "\n\n".join(lines)
 
