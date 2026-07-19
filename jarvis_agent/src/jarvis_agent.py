@@ -672,6 +672,98 @@ class JarvisAgent:
             else:
                 return ('high_unreliable', reason_str)
 
+    def _detect_emotion_shifts(self, voice_labels, face_labels):
+        """
+        跨句连续情绪突变检测 — 区分真实趋势转折与单句噪声。
+
+        算法:
+          1. 将窗口分为前半段和后半段
+          2. 比较两半段的主导情绪（众数）
+          3. 若主导情绪变化，且新情绪在后半段连续出现 ≥ min_run 次 → 判定为真实突变
+          4. 单句噪声（仅出现1-2次即恢复）不会被误判
+
+        返回: list[dict], 每个 dict 包含 modality / from / to / from_count / to_count / shift_at
+              无突变时返回空列表
+        """
+        shifts = []
+        min_run = 3  # 新情绪至少连续出现 3 次才判定为真实突变
+
+        for modality_name, labels in [("voice", voice_labels), ("face", face_labels)]:
+            n = len(labels)
+            if n < 6:
+                continue  # 窗口太小，不足以检测趋势
+
+            mid = n // 2
+            first_half = labels[:mid]
+            second_half = labels[mid:]
+
+            from collections import Counter
+            first_dom = Counter(first_half).most_common(1)
+            second_dom = Counter(second_half).most_common(1)
+            if not first_dom or not second_dom:
+                continue
+            from_emo, from_cnt = first_dom[0]
+            to_emo, to_cnt = second_dom[0]
+
+            if from_emo == to_emo:
+                continue  # 无变化
+
+            # 检查新情绪在后半段是否有连续 min_run 次出现
+            max_run = 0
+            cur_run = 0
+            shift_idx = None
+            for i, label in enumerate(second_half):
+                if label == to_emo:
+                    if cur_run == 0:
+                        run_start = mid + i
+                    cur_run += 1
+                    max_run = max(max_run, cur_run)
+                else:
+                    if cur_run >= min_run and shift_idx is None:
+                        shift_idx = run_start
+                    cur_run = 0
+            if cur_run >= min_run and shift_idx is None:
+                shift_idx = run_start
+
+            if max_run < min_run:
+                continue  # 新情绪不够持久 → 噪声
+
+            shifts.append({
+                'modality': modality_name,
+                'from_emotion': from_emo,
+                'to_emotion': to_emo,
+                'from_count': from_cnt,
+                'to_count': to_cnt,
+                'longest_run': max_run,
+                'shift_utterance': shift_idx + 1 if shift_idx is not None else mid + 1,
+            })
+
+        return shifts
+
+    def _build_emotion_shift_section(self, user_shifts, partner_shifts):
+        """将情绪突变检测结果格式化为 Prompt 段落。无突变时返回空字符串。"""
+        all_shifts = [(f"User ({mod})", s) for s in user_shifts
+                      for mod in [s['modality']]] + \
+                     [(f"Partner ({mod})", s) for s in partner_shifts
+                      for mod in [s['modality']]]
+
+        if not all_shifts:
+            return ""
+
+        lines = [
+            "**EMOTION SHIFT DETECTED** (pre-computed, cross-utterance trend analysis):",
+            "The following sustained emotion shifts were detected in this window.",
+            "Use this information in your EMOTIONS section — identify the likely trigger for each shift.",
+            "",
+        ]
+        for who, s in all_shifts:
+            lines.append(
+                f"  - {who}: {s['from_emotion']} → {s['to_emotion']} "
+                f"(near utterance #{s['shift_utterance']}, "
+                f"new emotion sustained for {s['longest_run']} consecutive utterances)"
+            )
+        return "\n".join(lines)
+
     def _apply_decision_gate(self, response_text: str, observation: MultimodalObservation):
         """
         Safety net: only warn when LLM completely misses the CONFLICT ATTRIBUTION section.
@@ -858,6 +950,8 @@ class JarvisAgent:
             'top_conflicts': top_conflicts,
             'low_quality': low_quality,
             'emotion_counts': emotion_counts,
+            'voice_labels': voice_labels_all,
+            'face_labels': face_labels_all,
         }
 
     def _format_utterance_with_top2(self, text: str, voice_probs: dict, face_probs: list) -> str:
@@ -1152,7 +1246,7 @@ class JarvisAgent:
         user_valid_ratios = getattr(observation, 'user_face_valid_ratios', [])
         partner_valid_ratios = getattr(observation, 'partner_face_valid_ratios', [])
 
-        # ---- 构建带 Top‑2 的对话文本（仅用于显示，可与 JSD 共用数据） ----
+        # ---- 构建带 Top‑2 的对话文本（每句一行，编号，便于 LLM 解析） ----
         def build_annotated_text(voice_list, face_list, speech_str, texts_list):
             if not speech_str or speech_str == "(silence)":
                 return "(silence)"
@@ -1162,8 +1256,10 @@ class JarvisAgent:
                 text = texts_list[idx] if idx < len(texts_list) else ""
                 voice = voice_list[idx] if idx < len(voice_list) else {}
                 face = face_list[idx] if idx < len(face_list) else [0.0] * 7
-                annotated.append(self._format_utterance_with_top2(text, voice, face))
-            return " | ".join(annotated)
+                annotated.append(
+                    f"  [{idx + 1}] {self._format_utterance_with_top2(text, voice, face)}"
+                )
+            return "\n".join(annotated)
         logger.info(f"DEBUG user_face_probs_list: {observation.user_face_probs_list[:2] if observation.user_face_probs_list else 'EMPTY'}")
         logger.info(f"DEBUG user_voice_probs_list: {observation.user_voice_probs_list[:2] if observation.user_voice_probs_list else 'EMPTY'}")
         
@@ -1239,12 +1335,24 @@ class JarvisAgent:
         # Build dynamic CONFLICT ATTRIBUTION section (now sees correct jsd_user/jsd_partner)
         conflict_attribution_section = self._build_conflict_attribution_section(observation, total_utterances)
 
+        # ---- 情绪突变检测（跨句时间维度，与 JSD 空间维度正交） ----
+        user_shifts = self._detect_emotion_shifts(
+            jsd_user.get('voice_labels', []),
+            jsd_user.get('face_labels', [])
+        )
+        partner_shifts = self._detect_emotion_shifts(
+            jsd_partner.get('voice_labels', []),
+            jsd_partner.get('face_labels', [])
+        )
+        emotion_shift_section = self._build_emotion_shift_section(user_shifts, partner_shifts)
+
         prompt = REALTIME_ANALYSIS_PROMPT_WITH_SUMMARY.format(
             window_size=window_size,
             user_speech_annotated=user_speech_annotated,
             partner_speech_annotated=partner_speech_annotated,
             conversation_history=history_text,
             conflict_attribution_section=conflict_attribution_section,
+            emotion_shift_section=emotion_shift_section,
         )
 
         # 追加冲突摘要（仅当有冲突时）

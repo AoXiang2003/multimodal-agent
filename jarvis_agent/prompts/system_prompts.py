@@ -112,9 +112,12 @@ Partner: {partner_speech}
 REALTIME_ANALYSIS_PROMPT_WITH_SUMMARY = """
 ## Current Conversation Window ({window_size} utterances)
 
-### Raw Dialogue (per-utterance, Top-2 voice and face probabilities):
-**User**: {user_speech_annotated}
-**Partner**: {partner_speech_annotated}
+### Raw Dialogue (numbered, one utterance per line, Top-2 voice and face probabilities):
+**User**:
+{user_speech_annotated}
+
+**Partner**:
+{partner_speech_annotated}
 
 ### Recent History:
 {conversation_history}
@@ -140,6 +143,7 @@ and briefly explain why.
   Format: **TOOL**: tool_name(param="value") — reason
   Always consider: would search_info or schedule_event or set_reminder or send_message help right now?
 
+{emotion_shift_section}
 **EMOTIONS**:
 - Summarize at the WINDOW level only. Do NOT enumerate individual utterances — focus on overall patterns.
 - Assess emotional stability: Are they stable, escalating, or fluctuating?

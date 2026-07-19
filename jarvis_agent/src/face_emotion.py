@@ -98,46 +98,44 @@ class FaceEmotionAnalyzer:
             logger.warning(f"ViT emotion failed: {e}")
             self.emotion_pipe = None
 
+    # ViT pipeline 返回结果按置信度降序排列，必须重排为固定标签顺序
+    FACE_LABELS = ['angry', 'disgust', 'fear', 'happy', 'neutral', 'sad', 'surprised']
+    _LABEL_MAP = {
+        'anger': 'angry', 'disgust': 'disgust', 'fear': 'fear',
+        'happy': 'happy', 'neutral': 'neutral', 'sad': 'sad',
+        'surprised': 'surprised',
+    }
+
+    def _reorder_probs(self, pipeline_result: list):
+        """将 pipeline 返回的 [{'label':..., 'score':...}, ...] 重排为固定 FACE_LABELS 顺序"""
+        score_dict = {}
+        for item in pipeline_result:
+            canonical = self._LABEL_MAP.get(item['label'], item['label'])
+            score_dict[canonical] = score_dict.get(canonical, 0.0) + item['score']
+        return [score_dict.get(label, 0.0) for label in self.FACE_LABELS]
+
     def _predict_emotion_with_probs(self, face_img: np.ndarray):
         """
-        返回 (情绪标签, 置信度, 7维概率向量)
+        返回 (情绪标签, 置信度, 7维概率向量 [angry, disgust, fear, happy, neutral, sad, surprised])
         """
         if self.emotion_pipe is None:
             return "neutral", 0.5, [0.0] * 7
         try:
             face_pil = Image.fromarray(cv2.resize(face_img, (224, 224)))
             result = self.emotion_pipe(face_pil)
-            # ===== 在这里加日志 =====
-            logger.debug(f"ViT result labels: {[item['label'] for item in result]}")
-            probs = [item['score'] for item in result]
-            label = result[0]['label']
-            score = result[0]['score']
-            label_map = {
-                'anger': 'angry', 'disgust': 'disgust', 'fear': 'fear',
-                'happy': 'happy', 'neutral': 'neutral', 'sad': 'sad',
-                'surprised': 'surprised'
-            }
-            return label_map.get(label, label), float(score), probs
+            probs = self._reorder_probs(result)
+            top_idx = int(np.argmax(probs))
+            top_label = self.FACE_LABELS[top_idx]
+            top_score = float(probs[top_idx])
+            logger.debug(f"ViT top: {top_label}({top_score:.3f}) | all: {dict(zip(self.FACE_LABELS, [f'{p:.3f}' for p in probs]))}")
+            return top_label, top_score, probs
         except Exception:
             return "neutral", 0.5, [0.0] * 7
 
     def _predict_emotion(self, face_img: np.ndarray) -> Tuple[str, float]:
         """兼容旧接口：仅返回标签和置信度"""
-        if self.emotion_pipe is None:
-            return "neutral", 0.5
-        try:
-            face_pil = Image.fromarray(cv2.resize(face_img, (224, 224)))
-            result = self.emotion_pipe(face_pil)
-            label = result[0]['label']
-            score = result[0]['score']
-            label_map = {
-                'anger': 'angry', 'disgust': 'disgust', 'fear': 'fear',
-                'happy': 'happy', 'neutral': 'neutral', 'sad': 'sad',
-                'surprised': 'surprised'
-            }
-            return label_map.get(label, label), float(score)
-        except Exception:
-            return "neutral", 0.5
+        label, score, _ = self._predict_emotion_with_probs(face_img)
+        return label, score
         
   
     def analyze_frames(self, video_path: str, timestamps: List[float]) -> List[dict]:
