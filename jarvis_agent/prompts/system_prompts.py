@@ -155,6 +155,81 @@ and briefly explain why.
 """
 
 # ============================================================
+# 两阶段推理 Prompt — 阶段1: 理解（SCENE + EMOTIONS + CONFLICT ATTRIBUTION）
+# ============================================================
+STAGE1_ANALYSIS_PROMPT = """
+## Current Conversation Window ({window_size} utterances)
+
+### Raw Dialogue (numbered, one utterance per line, Top-2 voice and face probabilities):
+**User**:
+{user_speech_annotated}
+
+**Partner**:
+{partner_speech_annotated}
+
+### Recent History:
+{conversation_history}
+
+---
+
+Focus ONLY on understanding what is happening in this conversation.
+Output ONLY these three sections, in this order:
+
+**SCENE**: Identify the conversation scenario (bureaucracy_dispute / career_advice /
+family_conflict / wedding_planning / casual_gossip / crisis_management / negotiation / other)
+and briefly explain why.
+
+**EMOTIONS**:
+- Summarize at the WINDOW level only. Do NOT enumerate individual utterances — focus on overall patterns.
+- Assess emotional stability: Are they stable, escalating, or fluctuating?
+- If there is a sudden emotional shift, identify the likely trigger.
+
+{emotion_shift_section}
+
+{conflict_attribution_section}
+
+CRITICAL: Output ONLY SCENE, EMOTIONS, and CONFLICT ATTRIBUTION.
+Do NOT output STRATEGY, TASKS, TOOLS, or PARTNER.
+"""
+
+# ============================================================
+# 两阶段推理 Prompt — 阶段2: 决策（STRATEGY + TASKS + TOOLS + PARTNER）
+# ============================================================
+STAGE2_DECISION_PROMPT = """
+## Analysis of Current Window
+
+{stage1_analysis}
+
+### Conversation Text (for reference when quoting specific utterances):
+**User**:
+{user_texts_brief}
+
+**Partner**:
+{partner_texts_brief}
+
+---
+
+Based on the analysis above, provide actionable recommendations.
+Output ONLY these four sections, in this order:
+
+**STRATEGY**: 1-2 concrete things the user should say or do RIGHT NOW.
+  CRITICAL: Reference specific conflicts and emotions identified in the analysis above.
+  When quoting an utterance, use the exact text from the Conversation Reference above.
+  Do NOT write generic advice — each suggestion must name the specific utterance or emotion it addresses.
+
+**TASKS**: 2-3 specific follow-up tasks. Be specific.
+
+**TOOLS**: Suggest terminal tools the user should use NOW. If genuinely no tool is applicable, write "none".
+  Format: **TOOL**: tool_name(param="value") — reason
+
+**PARTNER**: Predict what Speaker B will say or do next, and explain why.
+  Base this prediction on the specific emotional signals and conversation context.
+
+CRITICAL: Output ONLY STRATEGY, TASKS, TOOLS, and PARTNER.
+Do NOT repeat or summarize the SCENE, EMOTIONS, or CONFLICT ATTRIBUTION sections.
+"""
+
+# ============================================================
 # 实时分析 Prompt (无本地摘要时的回退版本)
 # ============================================================
 REALTIME_ANALYSIS_PROMPT = """

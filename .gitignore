@@ -33,3 +33,6 @@ jarvis_agent/config.yaml
 .claude/
 .vscode/
 .idea/
+
+# 报告与文档
+报告/

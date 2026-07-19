@@ -90,6 +90,8 @@ from prompts.system_prompts import (
     SESSION_SUMMARY_PROMPT,
     PERSONALIZATION_INJECTION,
     EMOTION_LABELS,
+    STAGE1_ANALYSIS_PROMPT,
+    STAGE2_DECISION_PROMPT,
 )
 
 logger = logging.getLogger(__name__)
@@ -350,16 +352,50 @@ class JarvisAgent:
         #     logger.info("=== PERSONALIZATION INJECTED ===\n%s", personalization)
         # else:
         #     logger.info("=== NO PERSONALIZATION (profile empty) ===")
-        # 始终使用增强版 Prompt（含 Top‑2 和 KL 散度）
-        remote_prompt = self._build_analysis_prompt_with_summary(
+        # ===== 两阶段推理：阶段1（理解）→ 阶段2（决策）=====
+        # 阶段1: SCENE + EMOTIONS + CONFLICT ATTRIBUTION
+        stage1_prompt = self._build_analysis_prompt_with_summary(
             observation=observation,
             history_text=history_text,
             local_emotion_summary=local_emotion_summary or "(no local summary)",
             history_turns_count=len(history_turns),
+            mode="stage1",
         )
-       
-        logger.info(f"=== FULL PROMPT ===\n{remote_prompt}")
-        response_text = self._call_remote_model(system_prompt, remote_prompt)
+        logger.info(f"=== STAGE1 PROMPT ===\n{stage1_prompt}")
+        stage1_output = self._call_remote_model(system_prompt, stage1_prompt)
+
+        if stage1_output is None:
+            # 降级：阶段1失败 → 回退单 prompt 模式
+            logger.warning("Stage 1 failed, falling back to single-prompt mode")
+            fallback_prompt = self._build_analysis_prompt_with_summary(
+                observation=observation,
+                history_text=history_text,
+                local_emotion_summary=local_emotion_summary or "(no local summary)",
+                history_turns_count=len(history_turns),
+                mode="full",
+            )
+            logger.info(f"=== FALLBACK FULL PROMPT ===\n{fallback_prompt}")
+            response_text = self._call_remote_model(system_prompt, fallback_prompt)
+        else:
+            # 阶段2: STRATEGY + TASKS + TOOLS + PARTNER
+            stage2_prompt = self._build_analysis_prompt_with_summary(
+                observation=observation,
+                history_text=history_text,
+                local_emotion_summary=local_emotion_summary or "(no local summary)",
+                history_turns_count=len(history_turns),
+                mode="stage2",
+                stage1_output=stage1_output,
+            )
+            logger.info(f"=== STAGE2 PROMPT ===\n{stage2_prompt}")
+            stage2_output = self._call_remote_model(system_prompt, stage2_prompt)
+
+            if stage2_output is not None:
+                response_text = stage1_output + "\n" + stage2_output
+                generated_by = "remote-2stage"
+            else:
+                logger.warning("Stage 2 failed, keeping stage 1 analysis only")
+                response_text = stage1_output
+                generated_by = "remote-stage1-only"
 
         # 远程不可用 → 本地模型兜底 (用精简 prompt)
         if response_text is None and self.local_model is not None:
@@ -1200,6 +1236,14 @@ class JarvisAgent:
         lines.append('  4. Suppressed emotion \u2192 "I sense you may be holding back some emotion."')
         lines.append("  5. Cannot determine \u2192 ask for clarification.")
         lines.append("")
+        lines.append("ATTRIBUTION GUIDANCE \u2014 read the utterance TEXT first, then check voice-face data:")
+        lines.append('  \u2022 If the utterance contains expletives, aggression, confrontation, or rhetorical questions')
+        lines.append('    \u2192 the emotion is being EXPRESSED. Consider Genuine masking or Social display, NOT Suppressed emotion.')
+        lines.append('  \u2022 If the utterance is restrained, polite, or indirect while voice-face shows strong emotion')
+        lines.append('    \u2192 the emotion is being HELD BACK. Suppressed emotion is the correct choice.')
+        lines.append('  \u2022 If the utterance is sarcastic in tone ("Oh, that\'s just great") OR the wording')
+        lines.append('    contradicts the likely true feeling \u2192 Sarcasm/irony.')
+        lines.append("")
         lines.append("CRITICAL: For [Partner] items, user CANNOT answer for partner.")
         lines.append('  Use ONLY: "Note: Partner\'s statement \'...\' shows voice-face conflict."')
         lines.append("")
@@ -1237,6 +1281,8 @@ class JarvisAgent:
             history_text: str,
             local_emotion_summary: str,
             history_turns_count: int,
+            mode: str = "full",
+            stage1_output: str = None,
     ) -> str:
         obs = observation.to_dict()
 
@@ -1346,14 +1392,38 @@ class JarvisAgent:
         )
         emotion_shift_section = self._build_emotion_shift_section(user_shifts, partner_shifts)
 
-        prompt = REALTIME_ANALYSIS_PROMPT_WITH_SUMMARY.format(
-            window_size=window_size,
-            user_speech_annotated=user_speech_annotated,
-            partner_speech_annotated=partner_speech_annotated,
-            conversation_history=history_text,
-            conflict_attribution_section=conflict_attribution_section,
-            emotion_shift_section=emotion_shift_section,
-        )
+        if mode == "stage1":
+            prompt = STAGE1_ANALYSIS_PROMPT.format(
+                window_size=window_size,
+                user_speech_annotated=user_speech_annotated,
+                partner_speech_annotated=partner_speech_annotated,
+                conversation_history=history_text,
+                conflict_attribution_section=conflict_attribution_section,
+                emotion_shift_section=emotion_shift_section,
+            )
+        elif mode == "stage2":
+            # Build brief numbered conversation text for stage 2 reference
+            def _format_brief(texts):
+                if not texts:
+                    return "(silence)"
+                return "\n".join(f"  [{i}] {t}" for i, t in enumerate(texts, 1))
+            user_texts_brief = _format_brief(user_texts)
+            partner_texts_brief = _format_brief(partner_texts)
+
+            prompt = STAGE2_DECISION_PROMPT.format(
+                stage1_analysis=stage1_output or "",
+                user_texts_brief=user_texts_brief,
+                partner_texts_brief=partner_texts_brief,
+            )
+        else:
+            prompt = REALTIME_ANALYSIS_PROMPT_WITH_SUMMARY.format(
+                window_size=window_size,
+                user_speech_annotated=user_speech_annotated,
+                partner_speech_annotated=partner_speech_annotated,
+                conversation_history=history_text,
+                conflict_attribution_section=conflict_attribution_section,
+                emotion_shift_section=emotion_shift_section,
+            )
 
         # 追加冲突摘要（仅当有冲突时）
         # if conflict_summary: (removed — redundant with Flagged above)
